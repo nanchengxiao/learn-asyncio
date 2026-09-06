@@ -43,8 +43,9 @@
 - **gate（闸门）**：本课对“进入受限 resource 前必须先获得许可”的控制点的白话称呼。
 - **shared state（共享状态）**：多份 Task 都能读写的同一份数据；如果修改步骤会相互打断，结果就可能不正确。
 - **`asyncio.Lock()`**：同一时刻只允许一个 Task 进入其保护范围的工具，本课用它保护 rate limiter 的 shared state。
+- **`asyncio.get_running_loop()`**：取得当前 coroutine 所在、并且正在运行的 Event Loop；本例先用它取得 Event Loop，再读取用于计算间隔的时间。
 - **monotonic clock（单调时钟）**：只用于比较经过时间、不会因为系统日期调整而倒退的时钟；适合计算调度间隔。
-- **`asyncio.get_running_loop().time()`**：取得当前 Event Loop 的 monotonic clock 数值；本例用它计算下一次允许启动的时刻。
+- **`loop.time()`**：读取当前 Event Loop 的 monotonic clock 数值；本例用它计算下一次允许启动的时刻。
 - **writer（写入器）**：负责把处理结果写入文件或其他存储位置的处理环节。
 
 **第三组：观察运行状态与识别系统风险**
@@ -256,7 +257,8 @@ event=shutdown_complete writer_peak=2 writer_limit=2
 | **gate** | 3 个 worker 共用容量为 2 的 `api_gate`，所以 worker 数不等于 API 容量；`writer_gate` 另行守住写入 resource |
 | **shared state** | 所有 worker 共用 `runtime["next_start"]`，每次安排 attempt 都必须读写它 |
 | **`asyncio.Lock()`** | `runtime["rate_lock"]` 一次只让一个 Task 负责“等到自己的时刻并推进下一时刻”；这里的等待有意位于锁内 |
-| **monotonic clock** | `asyncio.get_running_loop().time()` 提供只用于计算间隔的时间值，不把系统日期当调度依据 |
+| **`asyncio.get_running_loop()`** | `wait_for_rate_slot()` 用它取得当前 coroutine 正在使用的 Event Loop，并保存到 `loop` |
+| **monotonic clock / `loop.time()`** | `loop.time()` 提供只用于计算间隔的时间值，不把系统日期当调度依据 |
 | **writer** | `save(result, runtime)` 代表较慢写入；`writer_gate` 限制同时写入数量，`writer_stats` 实测 peak |
 | **counter / metrics** | 正常收尾后用 `received = succeeded + failed` 核对最终结果；`retried` 与 `duplicates` 记录过程事件，`writer_stats["peak"]` 记录资源占用峰值 |
 | **structured logging** | `log()` 输出输入关闭、retry、失败、duplicate 和 shutdown 完成等事件；retry 还带有等待时长字段 |
@@ -377,6 +379,8 @@ async with runtime["rate_lock"]:
         await asyncio.sleep(wait)
     runtime["next_start"] = loop.time() + interval
 ```
+
+`asyncio.get_running_loop()` 先取得正在执行 `wait_for_rate_slot()` 的 Event Loop，后面的 `loop.time()` 再读取它的单调时钟。这里关心的是“经过了多久”，不需要读取当前日期和时间。
 
 这里 `interval = 1 / QPS`。本例 `QPS = 20`，所以每次放行后，把下一次允许放行的时刻设为至少 0.05 秒以后。
 
