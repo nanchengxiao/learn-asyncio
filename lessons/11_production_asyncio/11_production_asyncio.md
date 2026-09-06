@@ -2,31 +2,41 @@
 
 ## 进入本课前
 
-你已经学过 Task lifecycle、cancellation、timeout、Semaphore、bounded Queue、backpressure、connection pool、blocking I/O、DAG、retry、rate limit 和 drain。
+前面几课已经分别回答了这些问题：
 
-本课不会重新定义这些词，而是在它们的基础上增加长期运行程序需要的约束。
+- Lesson 03～05：谁负责等待 Task 结束，怎样区分失败、超时和取消，并在退出时收尾；
+- Lesson 06～08：怎样限制资源占用和等待量，让处理压力通过 bounded Queue 传回输入端；
+- Lesson 09：遇到阻塞式调用时，怎样避免拖住 Event Loop；
+- Lesson 10：怎样按业务依赖安排执行顺序，并明确每一步失败后怎么办。
 
-这是综合应用课，不要求第一次阅读就记住 153 行代码。第一遍先沿一条普通工作追踪“进入等待区 → 被取出处理 → 调用外部能力 → 保存结果”，再观察输入结束后已经接收的工作怎样处理完；第二遍分别追踪“再次尝试后恢复”“再次尝试也不恢复”“外部状态已改变但返回结果超时”三条失败路径，最后再看程序怎样用数字和日志记录结果。示例只使用有限的 7 条工作构造可稳定运行的缩小模型，不会真的启动一个永不退出的线上服务。
+本课沿用这些概念，把它们组合到一个持续接收、处理并保存工作的程序中。重点是：**一条工作从接收到结束，要经过哪些限制；处理失败或程序准备停止时，谁负责把它收尾？**
+
+建议分两遍阅读：
+
+1. 第一遍只追踪“进入 Queue → worker 取出 → 调用外部接口 → 保存结果”，再看输入结束后，程序怎样处理完已接收的工作。
+2. 第二遍对照不同工作，分别看重试成功、重试用尽、直接失败，以及“外部状态已改变，但调用超时”的处理方式，最后核对日志和统计数字。
+
+示例只输入 7 条工作，便于运行和核对结果。它演示长期运行程序的核心处理流程，不要求你第一次阅读就记住整份代码。
 
 ## 本课新增术语
 
-这是综合课，词多但不是一张待背诵清单。先按“怎样结束与恢复”“怎样控制启动和 resource”“怎样从外部看见问题”三组建立位置感，随后再把每个词对到同一条 pipeline。
+下面的术语分成三组：怎样停止与恢复、怎样控制资源、怎样观察运行状态。先了解每组解决什么问题，再到示例中查找对应代码即可。
 
 **第一组：停止、失败恢复与重复执行保护**
 
 - **shutdown（关闭流程）**：程序从“还在正常接收和处理工作”走到“停止运行”的整个过程。
-- **graceful shutdown（优雅关闭）**：shutdown 时先按业务承诺处理已经开始的工作和 resource，再真正退出，而不是直接粗暴丢弃所有工作。
+- **graceful shutdown（优雅关闭）**：关闭时，先按业务约定处理待完成的工作、释放资源，再退出；本例约定处理完所有已接收的工作。
 - **attempt（一次尝试）**：针对同一业务 operation 发起的一次具体调用；retry 会产生新的 attempt。
-- **transient failure（暂时性失败）**：过一会儿再试有可能恢复的失败，例如短暂 network 故障。
-- **`ConnectionError`**：Python 内置的一种 connection 失败异常；本例把它明确归入可以有限 retry 的 transient failure。
-- **permanent failure（持久性失败）**：再次立即尝试通常也不会改变结果的失败，例如明确的参数错误。
+- **transient failure（暂时性失败）**：过一会儿再试有可能恢复的失败，例如短暂的网络故障；“可能恢复”不保证下一次一定成功。
+- **`ConnectionError`**：Python 内置的连接错误异常；本例用它模拟允许有限重试的网络故障。
+- **permanent failure（永久性失败）**：在请求内容和业务条件不变时，重复调用也无法解决的失败，例如参数不合法，需要先纠正问题。
 - **backoff（退避）**：一次失败后，不立刻发起下一次 attempt，而是先等待一段时间；连续失败时等待通常逐步增加。
 - **jitter（随机扰动）**：在 backoff 时间上增加少量随机变化，避免很多 worker 或 service 实例在同一时刻一起 retry。
 - **side effect（副作用）**：会改变外部状态的动作，例如写入数据、扣款、发送消息。
 - **idempotency（幂等性）**：同一个业务 request 被重复执行时，不会重复产生本不该重复的 side effect。
 - **set（集合）**：Python 中只保存不重复元素的容器；本例用它记录哪些 job id 已经产生过 side effect。
 
-**第二组：启动速率、共享状态与 resource 控制**
+**第二组：启动速率、共享状态与资源控制**
 
 - **QPS（Queries Per Second，每秒请求数）**：每秒启动多少次 request 的一种速率表达方式。
 - **rate limiter（速率限制器）**：真正执行 rate limit 规则、决定某个新 request 现在能不能启动的控制组件。
@@ -50,7 +60,9 @@
 
 ## 一个例子串起全部术语
 
-最后一课把前面机制放进同一条 job pipeline：bounded Queue 接收输入，固定数量 worker 处理工作，每个 API attempt 同时受 rate limit、concurrency limit 和 timeout 约束，结果写入也有独立容量，最后通过 drain 完成 graceful shutdown。代码就是本课的 `case.py`：
+沿用 Lesson 07 的流水线：输入端把 job 放进 bounded Queue，固定数量的 worker 逐条取出并处理。本课为每条 job 增加两段工作：先调用外部 API，再保存结果。调用失败时按规则重试；输入结束时，处理完已接收的工作再退出。
+
+阅读时可以先从 `main()` 找到 `worker()`，再顺着 `call_with_retry()` 和 `save()` 往下看。`external_api()` 用不同的 `behavior` 模拟成功和失败，`save()` 用等待模拟写入耗时；它们不访问真实外部系统，也不实际保存数据。`build_runtime()` 则集中创建本次运行共用的控制器和状态。完整代码与本课的 `case.py` 一致：
 
 ```python
 import asyncio
@@ -230,7 +242,7 @@ event=shutdown_complete writer_peak=2 writer_limit=2
 | **shutdown** | `main()` 从停止产生新 job、发送 sentinel，一直走到所有 worker 结束的完整停止过程 |
 | **graceful shutdown** | `await queue.join()` 先 drain 已接收 job，再离开 `TaskGroup`，而不是直接丢下仍在处理的工作 |
 | **attempt** | `for attempt in range(...)` 的每次循环都是同一 job 的一次具体外部调用 |
-| **显式测试数据** | `jobs` 中的 `behavior` 直接写出 `ok`、`transient`、`persistent` 等路径，不用对 job id 做取模运算让学习者猜行为 |
+| **示例输入** | `jobs` 中的 `behavior` 指定每条工作的模拟行为；`persistent` 表示连接故障一直没有恢复，与参数错误 `permanent` 不同 |
 | **transient failure** | Job 5 下一次 attempt 恢复；job 6 虽被分类为可 retry 的连接故障，但本次始终没有恢复 |
 | **`ConnectionError`** | `external_api()` 用它模拟 job 5 与 job 6 的连接故障；只有这个已分类类型进入 transient retry 路径 |
 | **permanent failure** | Job 7 触发专用的 `PermanentJobError("参数错误")`，worker 直接记录失败而不 retry |
@@ -246,7 +258,7 @@ event=shutdown_complete writer_peak=2 writer_limit=2
 | **`asyncio.Lock()`** | `runtime["rate_lock"]` 一次只让一个 Task 负责“等到自己的时刻并推进下一时刻”；这里的等待有意位于锁内 |
 | **monotonic clock** | `asyncio.get_running_loop().time()` 提供只用于计算间隔的时间值，不把系统日期当调度依据 |
 | **writer** | `save(result, runtime)` 代表较慢写入；`writer_gate` 限制同时写入数量，`writer_stats` 实测 peak |
-| **counter / metrics** | `received = succeeded + failed` 核对最终结果；`retried` 与 `duplicates` 记录可重叠事件，`writer_stats["peak"]` 另行记录 resource 峰值 |
+| **counter / metrics** | 正常收尾后用 `received = succeeded + failed` 核对最终结果；`retried` 与 `duplicates` 记录过程事件，`writer_stats["peak"]` 记录资源占用峰值 |
 | **structured logging** | `log()` 输出输入关闭、retry、失败、duplicate 和 shutdown 完成等事件；retry 还带有等待时长字段 |
 | **额外日志字段** | `log(event, **fields)` 把 `job_id=...`、`reason=...` 等命名字段收集成 dictionary，随后稳定地输出每个字段 |
 | **observability** | 日志指出具体 job 的路径，最终 metrics 给出总量，两者组合后才能解释结果 |
@@ -260,12 +272,12 @@ event=shutdown_complete writer_peak=2 writer_limit=2
 1. `main()` 创建容量为 3 的 Queue 和 3 个长期 worker；输入更快时，`queue.put()` 会把 backpressure 传回生产侧。
 2. Worker `get()` 一条 job 后调用 `call_with_retry()`，第一次循环就是 attempt 1。
 3. 最多两个 worker 能同时通过 `api_gate`；attempt 取得许可后再由 rate limiter 等到允许启动的时刻，最后只给真正的外部调用套上 timeout。
-4. 普通 job 调用成功后通过 `writer_gate` 保存结果，并增加 `succeeded` counter；最终日志中的 `writer_peak=2` 证明写入上限真实参与了运行。
+4. 普通 job 调用成功后，worker 通过 `writer_gate` 模拟保存结果，返回后才增加 `succeeded`。代表性输出中的 `writer_peak=2` 表示最多有两次写入重叠；具体峰值取决于调度，但不应超过 `writer_limit`。
 5. Job 5 第一次遇到 transient failure，记录 backoff 时长并等待后，下一次 attempt 成功。
 6. Job 6 的连接故障连续出现；首次 attempt 之外只允许两次 retry，三次都失败后记录 `retries_exhausted`，证明循环有终点。
 7. Job 4 第一次已经登记 side effect，但等待 response 时 timeout；retry 时幂等检查识别相同 job id，只返回 duplicate 结果并增加 counter。
 8. Job 7 遇到 permanent failure，不进入 retry 分支，直接记录 `job_failed`。
-9. 每条 job 无论成功或失败，都在 `finally` 中执行 `queue.task_done()`，因此 `queue.join()` 的完成条件可信。
+9. 每次成功 `get()` 后，worker 都在 `finally` 中配对调用 `task_done()`，包括取到 sentinel 时。正常路径下，这表示当前条目已处理结束；它不表示每条 job 都成功了。
 10. 输入结束时先记录 `input_closed`，再为每个 worker 放入一个 sentinel，并等待 Queue drain。
 11. 三个 worker 全部结束后 `TaskGroup` 才退出并记录 `shutdown_complete`；日志同时报告 writer peak 与 limit，最终 metrics 是 7 条接收、5 条成功、2 条失败、4 次 retry、1 次 duplicate。
 
@@ -285,27 +297,29 @@ event=shutdown_complete writer_peak=2 writer_limit=2
 
 ## 为什么需要学习它
 
-长期运行程序的问题通常不是某一个工具单独出错，而是多个机制互相影响：
+前面各课分别解决了任务归属、超时和容量问题。把它们放进同一个程序后，还要考虑它们怎样相互影响。例如，缺少合理限制时可能出现：
 
 ```text
 downstream 变慢
     ↓
-Queue 变长
+等待处理的工作增多
     ↓
-timeout 增多
+调用等待变久，timeout 增多
     ↓
 retry 增多
     ↓
 downstream 压力更大
 ```
 
-同时，程序还必须面对 shutdown、重复 job、writer resource 上限、长期存在的 Task lifecycle，以及“出了问题之后怎么知道”。
+Lesson 07 的 bounded Queue 能限制队列中的等待量，并让输入端放慢，但不能让下游自动恢复。本课还要给重试设定边界，防止失败后的额外调用继续加重压力。
+
+此外，程序要能回答：重复调用会不会重复改变外部状态？写入跟不上时，工作在哪里等待？停止接收输入后，已经接收的工作怎么办？出问题时，从哪里看出原因？
 
 最后一课的目标，就是把前面已经学过的独立机制组合成一个可解释的整体模型。
 
 ## 核心理论
 
-### 1. 先画完整 pipeline
+### 1. 沿用前课模型，先画出整条处理流程
 
 ```text
 输入
@@ -323,11 +337,11 @@ writer concurrency gate
 结果存储
 ```
 
-API 已在 Lesson 09 定义；这里的“外部 API”表示当前程序要调用的外部接口。
+和 Lesson 10 一样，先确认依赖：同一条 job 必须先取得 API 结果，才能保存结果。因此，这两步在同一个 worker 中顺序 `await`，不需要各创建一个 Task。不同 worker 处理的 job 则可以交错推进。
 
-Gate 表示：只有满足对应 resource 限制的工作，才能进入下一段。
+再沿用 Lesson 06～08 的容量模型：Queue 限制尚未取出的工作数量，worker 数限制同时处理多少条 job，两个 gate 分别限制 API 阶段和写入阶段。三个 worker 共用两张 API 通行证，因此 worker 数不等于 API 并发数。
 
-示例里的 `build_runtime()` 在 `main()` 已经运行后创建 Queue 之外的 gates、Lock、共享状态和 metrics。它们只属于这一次 service lifecycle；如果把这些可变对象长期放在模块全局，重复运行或测试时就可能继承上一次状态，让 ownership 变模糊。
+最后确认归属：`main()` 创建 Queue，并通过 `build_runtime()` 创建本次运行的 Semaphore、Lock、共享状态和指标，再显式传给 worker。所有 worker 由同一个 `TaskGroup` 负责。这样重复调用主流程时，每次都会获得独立状态，不会继承上次的计数和处理记录。
 
 ### 2. Concurrency limit 与 rate limit 同时存在
 
@@ -364,9 +378,13 @@ async with runtime["rate_lock"]:
     runtime["next_start"] = loop.time() + interval
 ```
 
-这次 `sleep()` **有意放在锁内**。拿到 Lock 的 Task 是当前队首：它等到允许时刻，把下一时刻推进一个 `interval`，然后释放 Lock；后来的 Task 才能接着计算自己的等待。这样实现简单、启动间隔直观，而且队首在等待时被 cancellation，不会留下一个无人使用的未来预留时刻。
+这里 `interval = 1 / QPS`。本例 `QPS = 20`，所以每次放行后，把下一次允许放行的时刻设为至少 0.05 秒以后。
 
-这不是“所有 sleep 都应该放在 Lock 内”的通用规则。这里 Lock 保护的业务不变量就是“只有队首能等待并推进同一条启动时间线”，因此等待本身属于临界流程；代价是其他 Task 会在 Lock 外排队。另一类实现可以在短暂加锁时一次性预留各自的未来时刻，再到锁外等待，但必须额外处理 cancellation 造成的空槽、很远的预留和算法公平性。选择哪种形状，要先说清 limiter 的承诺。
+为什么需要 Lock？假设两个 Task 都读到同一个 `next_start`，然后各自等待到那个时刻，它们就可能一起启动。Lock 把“读取时刻 → 等待 → 更新下一时刻”作为一个整体，一次只允许一个 Task 执行。
+
+因此，这次 `sleep()` **有意放在锁内**：拿到锁的 Task 先等到自己的启动时刻，更新 `next_start` 后释放锁，后一个 Task 再计算自己的等待时间。等待期间 Event Loop 仍能调度其他工作，只是其他需要这把锁的 Task 必须排队。若当前 Task 在 `sleep()` 时被取消，`async with` 会释放锁，也不会提前写入一个尚未使用的未来时刻。
+
+这里要保护的是整段启动安排，所以把等待也放在锁内。其他共享状态是否需要同样处理，应根据具体读写步骤判断，不能照搬锁的范围。
 
 本例还把顺序写成：
 
@@ -377,7 +395,9 @@ async with runtime["api_gate"]:
         ...
 ```
 
-先取得 concurrency gate，再等到 rate slot，能保证 limiter 放行后马上开始外部调用，不会又在 gate 后面等待。代价是等待 rate slot 或 Lock 时会占一份 concurrency 许可；真实系统应根据下游规则、排队成本和 limiter 算法明确选择顺序，而不是认为两种限制可以随意交换。
+这里的顺序是“先拿 API 通行证，再等待允许启动的时刻，最后开始调用”。这样限速器放行后，不会再因为等待通行证而推迟启动。
+
+如果交换顺序，多条已被限速器放行的调用可能堵在 Semaphore 外，随后又在通行证可用时集中启动。本例选择的代价是：等待 Lock 或启动时刻时，也会占用 API 通行证。因此，`api_gate` 限制的范围包含这段等待，实际正在调用 API 的数量可能更少。
 
 ### 3. 每个 attempt 都要有自己的 timeout
 
@@ -400,10 +420,12 @@ attempt 3 → 成功
     +
 每次 attempt 有 timeout
     =
-外部调用部分才有可解释上界
+为外部调用的等待设置边界
 ```
 
-这还不是整个 job 的总时限：进入 Queue、等待 gate、等待 rate slot，以及真实系统可能加入的 retry 间隔，都可能额外耗时。如果业务要求 job 从接收到完成也有总 time budget，还需要在更外层建立 operation 级时间边界。
+沿用 Lesson 05 的规则，timeout 约束的是它包住的代码范围。本例的 0.2 秒只覆盖 `external_api()`，不包含入队和排队、等待通行证、等待启动时刻、重试前的 backoff，以及后续写入。
+
+因此，最多调用三次、每次 timeout 为 0.2 秒，不能推出整条 job 会在 0.6 秒内结束。如果业务要求从接收到完成也有总时限，还需要为整个 operation 单独设计时间边界。Timeout 依靠协作式取消生效，也不是无论内部代码怎样执行都能准时终止的硬保证。
 
 ### 4. 只对明确的失败类型 retry
 
@@ -426,7 +448,17 @@ permanent failure     → 通常不 retry
 
 > retry 必须有适用条件和次数上限。
 
-失败分类还要落到明确异常类型上：`PermanentJobError` 直接表示已知的 permanent 业务失败，`ConnectionError` 才进入本例允许 retry 的 transient 路径。这样 worker 不需要用宽泛异常猜测失败含义。
+沿用 Lesson 10 的做法，把失败含义落实到明确异常类型上：
+
+| 调用结果 | 本例的处理方式 |
+| --- | --- |
+| `ConnectionError` | 视为可能恢复的连接故障，有剩余次数时重试 |
+| `TimeoutError` | 在本例具备重复执行保护的前提下，允许有限重试 |
+| `PermanentJobError` | 请求本身有问题，直接交给 worker 记录失败 |
+| 重试次数用尽 | 抛出 `RetriesExhaustedError`，由 worker 记录失败 |
+| 调用者取消或未知异常 | 不在这里转成普通失败，继续向外传播 |
+
+这也延续了 Lesson 05 的结论：超时本身并不说明可以重试。本例为什么允许重试超时调用，要结合下一节的幂等性一起理解。
 
 `MAX_RETRIES = 2` 表示首次 attempt 之外最多再试两次，所以最多有三个 attempts。示例中的 job 6 连续三次连接失败，第三次后不会再打印 retry，而是明确进入 `retries_exhausted` 失败路径。
 
@@ -466,7 +498,11 @@ attempt 2
 
 > 只有 `job_id` 字段本身不会自动产生 idempotency；代码必须真的用它阻止重复 side effect。
 
-本课的内存 `set` 只用来把判断过程演示清楚。真正跨进程、会重启的 service 通常需要把幂等记录放进持久化存储，并保证“检查是否处理过”与“登记 side effect”之间不会被并发请求穿透；否则进程重启或两个相同 request 同时到达时，仍可能重复执行。
+对照 job 4 看：第一次调用先把 id 加入 `processed_ids`，表示副作用已经发生，随后等待 1 秒来模拟迟迟未返回的响应。外层 0.2 秒的 timeout 先到期，所以调用方没有拿到结果。第二次调用仍使用同一个 id，检查发现已经处理过，就返回 `duplicate` 结果，避免再次产生副作用。
+
+本例在同一个 Event Loop 中执行，检查 id 与登记 id 之间没有 `await`，所以这段模拟检查不会被另一个 worker 在中间打断。但内存 `set` 只适合演示：程序重启后记录会丢失，多个进程也不会自动共享这份集合。
+
+真实系统要让幂等记录在重启后仍可用，并保证检查、执行业务动作和记录结果相互配合，避免两个相同请求同时通过检查。调用方还必须确认外部接口确实支持这样的保护；只在本地保留一个 id，不能保证外部扣款或发送消息只发生一次。
 
 ### 6. Writer 也有 resource 容量
 
@@ -486,7 +522,9 @@ writer concurrency gate
 
 所以 resource 模型要覆盖整条 pipeline，而不是只盯住外部调用。
 
-本例把模拟写入设置得比相邻 API attempt 的启动间隔稍慢，并复用 Lesson 06 的 `active / peak / finally` 观测方式。这样 `shutdown_complete` 中的 `writer_peak=2 writer_limit=2` 能直接证明两件事：写入确实发生过重叠，而且实际同时写入数没有越过容量。`finally` 则保证普通失败或 cancellation 不会让 active 观测值永久多算。
+本例复用 Lesson 06 的 `active / peak / finally` 观测方式：进入写入范围时增加 `active`，离开时在 `finally` 中减回去，并记录运行中观察到的最大值 `peak`。代表性输出 `writer_peak=2 writer_limit=2` 表示这次运行确实出现了两次写入重叠；验收上限时应检查 `peak <= writer_limit`，不能要求每种调度下峰值都恰好等于 2。
+
+本例由 worker 自己等待 `save()` 返回，因此写入变慢会让 worker 更晚取下一条 job，进而让 Queue 填满、输入端等待。这就是 Lesson 07 的反压沿整条流水线向上传递。
 
 失败边界也要按 pipeline 阶段区分。本例只在 `call_with_retry()` 周围捕获 `PermanentJobError` 与 `RetriesExhaustedError`；`save()` 放在这个 `except` 范围之外。于是一个未知 writer 错误会让 `TaskGroup` 明确失败，而不会被错误计入“API permanent failure”。真实业务也可以为 writer 设计 retry 或隔离策略，但必须单独决定，不能复用 API 的错误分类假装已经处理。
 
@@ -497,9 +535,11 @@ writer concurrency gate
 ```text
 停止接收新输入
     ↓
-让 Queue drain
+发送每个 worker 各自的 sentinel
     ↓
-worker 处理完已接收 job
+worker 继续处理已接收 job，完成后登记 task_done()
+    ↓
+queue.join() 返回，并等待所有 worker 结束
     ↓
 关闭 client / writer 等 resource
     ↓
@@ -508,7 +548,11 @@ worker 处理完已接收 job
 程序结束
 ```
 
-这就是 graceful shutdown：不是“永远不 cancellation”，而是先明确哪些工作承诺处理完、哪些工作允许停止，再按顺序收尾。
+这延续了 Lesson 07 的 drain：停止新增工作后，把已接收的工作处理完。`queue.join()` 只是等待完成登记，真正处理 job 的仍然是 worker；离开 `TaskGroup` 则确保这些 worker 都已结束。
+
+这里的“处理完”包括成功保存结果，也包括明确记录已知失败，不要求每条 job 都成功。若出现未知异常或上层取消，本例会沿 Lesson 03～04 的规则退出：任务收尾，失败或取消继续向外传播，不再承诺完成正常 drain，也不会打印正常的 `shutdown_complete`。`task_done()` 在这条路径上仅配对本次 `get()`，不能拿来证明业务成功。
+
+Graceful shutdown 要先明确哪些工作承诺处理完、哪些情况允许停止，再安排收尾顺序。若业务只允许等待固定时长，还要另行约定超过关闭时限后如何处理未完成工作。
 
 `case.py` 使用有限的 7 条 job，把“输入结束”当作 shutdown 触发点，所以可以稳定运行和观察。真实长期 service 还需要把操作系统信号、服务框架关闭通知或管理员命令转换成“停止接收新输入”；这属于接入环境的边界，不在这个最小核心示例里伪造。
 
@@ -530,14 +574,16 @@ duplicates
 
 这些只是字段名，例如 `retried` 这个 counter 表示“累计发生过多少次 retry”。
 
-不同 counter 不一定互斥。本例的最终结果满足：
+不同 counter 统计的对象并不相同。本例正常处理完全部输入后，最终结果满足：
 
 ```text
 received = succeeded + failed
        7 = 5 + 2
 ```
 
-但 `retried=4` 是额外 attempt 事件，`duplicates=1` 是某条最终成功 job 走过的幂等分支；它们会与成功/失败 job 重叠，不能再全部加进 `received`。设计 metrics 时要先写清每个 counter 统计的是“job 最终分类”还是“过程中发生的事件”。
+这里成功的 5 条是 job 1～5，失败的 2 条是 job 6 和 7。`retried=4` 来自 job 4、5 各重试一次，job 6 重试两次；`duplicates=1` 来自 job 4 第二次调用命中幂等检查。这些过程事件已经发生在那 7 条 job 中，不能再加到接收总数里。
+
+再细看计数位置：`retried` 在 backoff 之前增加，严格说记录的是“已决定安排一次重试”，不保证取消发生后那次调用仍会启动。`received` 则在 `queue.put()` 之前增加，所以中途取消时也不能直接把它当成成功入队数。上面的等式用于本例正常收尾后的核对，不是任意时刻都成立的关系。
 
 如果：
 
@@ -582,7 +628,7 @@ event=job_retry job_id=123 attempt=2 reason=timeout
 
 - retry metrics 快速上涨；
 - downstream 的失败同时增加；
-- Queue 中等待的 job 持续增加；
+- Queue 经常达到容量上限，输入端等待变久；
 - structured logging 中出现大量相似 retry 事件。
 
 如果出现 task leak，可以观察：
@@ -635,10 +681,12 @@ resources 关闭
 
 ```text
 attempt
-  ├─ 成功              → 继续
-  ├─ transient failure → 还有次数时可以 retry
-  ├─ permanent failure → 当前 job 失败
-  └─ cancellation      → 继续向上层传播停止信号
+  ├─ 成功                     → 保存结果，再记录 job 成功
+  ├─ 连接故障或允许重试的超时   → 释放 API 通行证
+  │                            ├─ 还有次数 → backoff → 重新申请通行证和启动时刻
+  │                            └─ 次数用尽 → 记录 job 失败
+  ├─ permanent failure        → 不重试，记录 job 失败
+  └─ cancellation 或未知异常   → 收尾并向外传播
 ```
 
 ## 常见误解
@@ -649,8 +697,8 @@ attempt
 - **误区：** 失败就无限 retry 能提高成功率。  
   **更准确：** 这可能形成 retry storm，并放大 downstream 的压力。
 
-- **误区：** 每个 retry 共享一个无限等待的 attempt 也没关系。  
-  **更准确：** 每次 attempt 自己仍应有 timeout。
+- **误区：** 只要限制重试次数，整条 job 就一定能及时结束。
+  **更准确：** 单次调用也需要 timeout；排队、backoff 和写入等耗时还要另行考虑。
 
 - **误区：** 有 `job_id` 就天然具备 idempotency。  
   **更准确：** 实现必须真的利用稳定标识避免重复 side effect。
@@ -675,23 +723,16 @@ attempt
 
 ## 本节规则总结
 
-1. 把整条 pipeline 的 resource 容量都画出来。
-2. Concurrency limit 与 rate limit 是两个独立限制。
-3. 每个外部调用 attempt 都有自己的 timeout。
-4. Retry 只对明确适合的失败类型生效，而且次数有限。
-5. Retry 前要 backoff；多实例场景通常还要用 jitter 打散同步重试。
-6. Retry 可能重复执行，所以要用 idempotency 防止重复 side effect。
-7. Writer 也有自己的 concurrency limit，并应通过 active / peak 等真实行为验证。
-8. Graceful shutdown 顺序必须与业务承诺一致；需要时先 drain。
-9. Metrics 与 structured logging 一起提供基础 observability；每个 counter 还要写清是否与其他 counter 互斥。
-10. Retry storm 与 task leak 都应该有可观察信号。
-11. Gates、Lock、共享状态和 metrics 应由明确的 service lifecycle 拥有，不要无意跨运行残留。
-12. Lock 的范围由它保护的不变量决定；本例为了逐个放行 attempt，有意让队首在 Lock 内等待并推进启动时间。
-13. Attempt timeout 不自动覆盖 Queue、gate、rate slot 等整个 job 等待时间。
-14. 生产 idempotency 通常需要持久且并发安全的记录，内存 `set` 只适合演示原理。
-15. 用专用异常表达 permanent failure 与 retry 用尽，并把 `except` 范围限制在对应 pipeline 阶段。
-16. 示例中的模拟 I/O 不需要关闭，不代表换成真实 client 或 writer 后可以省略 lifecycle 与 cleanup。
-17. 内存 dictionary 与 `print()` 适合演示 observability，不等于跨进程、跨重启的生产 metrics / logging backend。
+1. 先画依赖和容量：同一条 job 顺序调用、保存，不同 worker 并发处理；Queue、API 和 writer 分别有自己的上限。
+2. 并发限制控制同时占用量，速率限制控制启动速度；首次调用和重试都要经过这两道限制。
+3. Lock 保护完整的共享状态操作；本例把读取、等待和更新启动时刻放在同一个锁内。
+4. 单次调用需要 timeout，整条 job 的总时限要另行设计。
+5. 只重试明确允许的失败，限制次数，并在重试前 backoff；多实例场景还要考虑 jitter。
+6. 重试前确认重复执行安全。幂等性需要实际阻止重复副作用，不能只靠一个 id 字段。
+7. 沿用前课的明确异常分类：已知失败在对应阶段处理，未知错误和取消继续向外传播。
+8. 正常关闭时，先停止输入并 drain，再等待 worker 结束，最后关闭真实资源；完成登记不等于业务成功。
+9. 指标说明总体数量，日志解释具体事件；区分 job 的最终结果和重试等过程事件。
+10. Task 和共享状态都要有明确归属。真实部署还需补齐资源关闭、持久化幂等记录，以及跨进程的指标和日志收集。
 
 ## 关键问题
 
@@ -705,7 +746,7 @@ attempt
 8. rate limiter 负责什么？
 9. gate 在本课里表示什么？
 10. 为什么每次 attempt 自己仍要有 timeout？
-11. writer 为什么也需要 resource 上限？哪一行输出证明本例确实触及了这个上限？
+11. writer 为什么也需要资源上限？怎样用输出中的 `writer_peak` 和 `writer_limit` 检查写入并发？
 12. counter 与 metrics 有什么关系？
 13. graceful shutdown 与 drain 的关系是什么？
 14. metrics 与 structured logging 分别提供什么信息？
@@ -720,7 +761,7 @@ attempt
 23. 为什么 `PermanentJobError` / `RetriesExhaustedError` 比捕获所有 `ValueError` / `RuntimeError` 更能保护错误分类？为什么 writer 位于这些 `except` 之外？
 24. `def log(event, **fields)` 与表达式 `2 ** n` 中的 `**` 分别是什么意思？
 25. 为什么本例使用 3 个 worker，却只给 API gate 2 张通行证？
-26. 为什么 `received = succeeded + failed`，却不能再把 `retried` 与 `duplicates` 一起加进这个等式？
+26. 为什么正常收尾后 `received = succeeded + failed`，却不能再加上 `retried` 与 `duplicates`？中途取消时，这个等式还一定成立吗？
 
 ## 场景命题
 
@@ -754,16 +795,22 @@ attempt
 - 输入关闭后先 drain，所有 worker 都结束，最后才打印 shutdown 完成；
 - 最终 metrics 能与逐条结构化日志互相核对。
 
-实现前先画出 Queue、worker、API gate、rate limiter、writer gate 的顺序，并明确每个可变对象由哪个 lifecycle 创建。实现后至少连续运行两次，确认第二次不会继承第一次的 metrics、幂等记录或 rate limiter 时间状态。
+实现前先画出 Queue、worker、API gate、rate limiter、writer gate 的顺序，并明确每个可变对象由哪一层创建和管理。实现后在同一个进程中连续调用主流程两次，确认第二次不会继承第一次的指标、幂等记录或限速器时间状态；仅重新启动脚本，不能验证进程内是否残留了全局状态。
 
-不要从空白文件一次写完整条 pipeline。建议按四个可运行关卡推进：
+可以直接复用 `case.py` 中的 `external_api()` 模拟函数和 `jobs` 数据，不必重新编写故障模拟。先只保留普通成功输入，之后逐项加入失败场景。
 
-1. 先完成 bounded Queue、固定 worker、普通 API 成功与 writer；
-2. 再加入 API concurrency limit、rate limit 和 attempt timeout；
-3. 再加入明确失败分类、有限 retry、backoff 与 idempotency；
-4. 最后加入 graceful shutdown、structured logging、metrics，并覆盖上面的验收路径。
+建议按下面的关卡推进，每关都能独立运行并退出：
 
-每一关都先运行并确认输出，再进入下一关；这样出现问题时，只需要检查刚增加的一个机制。
+| 关卡 | 本次增加什么 | 运行后检查什么 |
+| --- | --- | --- |
+| 1 | 复用 Lesson 07 的 bounded Queue、固定 worker、sentinel、`task_done()` 和 `join()` | 普通 job 全部处理完，worker 全部结束 |
+| 2 | 在 worker 内顺序调用 API 和 writer，并给两者设置 Semaphore | 保存发生在 API 返回后，写入峰值不超过上限 |
+| 3 | 加入 rate limiter | 每次 API 启动前都经过限速等待 |
+| 4 | 加入单次调用 timeout | 超时能向外报告，不能挂住整个示例 |
+| 5 | 加入失败分类、有限 retry 和 backoff，并启用幂等检查 | 逐项加入 transient、persistent、permanent 和副作用后超时场景，核对各自结果 |
+| 6 | 汇总结构化日志与指标，检查完整关闭流程 | 输入关闭后继续处理，所有 worker 结束后才报告关闭完成，正常运行的数字能核对 |
+
+每一关先确认新增行为，再进入下一关。最后单独让 writer 抛出一次未知异常，确认它使任务组失败，而不是被记成 API 业务失败。第一关已有正常退出流程，最后一关是在此基础上核对关闭承诺和观察信号。
 
 ---
 

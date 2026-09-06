@@ -1,3 +1,5 @@
+# 想跳出循环
+
 # Lesson 07 — 让等待中的工作也有明确上限
 
 ## 进入本课前
@@ -71,7 +73,7 @@ async def worker(queue, name):
         item = await queue.get()
         try:
             if item is SENTINEL:           # worker 自己识别并干净退出
-                break
+                break  					   # 跳出循环前finally 拦路先执行，然后while 循环才真正退出
             await asyncio.sleep(0.1)       # 处理这一条 item
             print(f"[{name}] 完成 {item}")
         finally:
@@ -83,7 +85,7 @@ async def main():
         for worker_number in range(WORKERS):
             tg.create_task(worker(queue, f"worker-{worker_number}"))
         await producer(queue)
-        await queue.join()                 # drain：已接收的工作全部处理完
+        await queue.join()                 # 等待所有已放入 Queue 的 item 都完成对应的`task_done()`
     print("pipeline 结束")
 
 asyncio.run(main())
@@ -115,28 +117,28 @@ pipeline 结束
 
 把本课知识点对到代码上：
 
-| 术语或知识点 | 在这个例子里指什么 |
-| --- | --- |
-| **Queue** | `main()` 创建的 `queue` 是 producer 与两个 worker 之间临时保存待处理 item 的容器 |
-| **producer** | `producer()` 逐项读取 `source()`，再把每个 item 放入 Queue |
-| **consumer** | 两个 `worker()` 从 Queue 取出并处理 item；它们就是本例的 consumer |
-| **upstream** | `source()` 和读取它的 `producer()` 位于 pipeline 较早的一侧 |
-| **`maxsize`** | `maxsize=2` 表示 Queue 内最多保存 2 个尚未被取走的 item |
-| **bounded Queue** | 设置容量后的 `asyncio.Queue(maxsize=2)`，让 backlog 不能无限留在 Queue 中 |
-| **backpressure** | Queue 满时 `await queue.put(item)` 暂停，producer 因而不能继续读取下一项 |
-| **`queue.put(item)`** | 把普通数据或 sentinel 放入 Queue；容量满时会等待 |
-| **`queue.get()`** | worker 取下一项；Queue 暂时为空时会等待新数据到来 |
-| **`queue.qsize()`** | 输出中的数字只计算仍在 Queue 里的 item，不包括两个 worker 已经取走并正在处理的 item |
-| **`queue.task_done()`** | 每个被 `get()` 取走的 item，无论普通数据还是 sentinel，完成处理后都对应调用一次 |
-| **`queue.join()`** | 等待所有已放入 Queue 的 item 都完成对应的 `task_done()` |
-| **AsyncIterable / AsyncIterator** | `source()` 返回的对象既能开始异步遍历，也保存这次遍历已经走到哪里 |
+| 术语或知识点                                | 在这个例子里指什么                                                                                      |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| **Queue**                             | `main()` 创建的 `queue` 是 producer 与两个 worker 之间临时保存待处理 item 的容器                    |
+| **producer**                          | `producer()` 逐项读取 `source()`，再把每个 item 放入 Queue                                          |
+| **consumer**                          | 两个`worker()` 从 Queue 取出并处理 item；它们就是本例的 consumer                                      |
+| **upstream**                          | `source()` 和读取它的 `producer()` 位于 pipeline 较早的一侧                                         |
+| **`maxsize`**                       | `maxsize=2` 表示 Queue 内最多保存 2 个尚未被取走的 item                                               |
+| **bounded Queue**                     | 设置容量后的`asyncio.Queue(maxsize=2)`，让 backlog 不能无限留在 Queue 中                              |
+| **backpressure**                      | Queue 满时`await queue.put(item)` 暂停，producer 因而不能继续读取下一项                               |
+| **`queue.put(item)`**               | 把普通数据或 sentinel 放入 Queue；容量满时会等待                                                        |
+| **`queue.get()`**                   | worker 取下一项；Queue 暂时为空时会等待新数据到来                                                       |
+| **`queue.qsize()`**                 | 输出中的数字只计算仍在 Queue 里的 item，不包括两个 worker 已经取走并正在处理的 item                     |
+| **`queue.task_done()`**             | 每个被`get()` 取走的 item，无论普通数据还是 sentinel，完成处理后都对应调用一次                        |
+| **`queue.join()`**                  | 等待所有已放入 Queue 的 item 都完成对应的`task_done()`                                                |
+| **AsyncIterable / AsyncIterator**     | `source()` 返回的对象既能开始异步遍历，也保存这次遍历已经走到哪里                                     |
 | **async generator function / object** | `source` 是含 `yield` 的 `async def`；调用 `source()` 得到保存暂停位置的 async generator object |
-| **`StopAsyncIteration`** | `source()` 的 `for` 循环结束后由 async generator object 在内部发出，`async for` 据此停止 |
-| **`async for`** | `async for item in source()` 一项一项推进数据源，每次都允许先在 `asyncio.sleep()` 等待 |
-| **sentinel** | `SENTINEL = object()` 是 producer 与 worker 约定的结束标记；两个 worker 各收到一个 |
-| **`object()` / `is`** | `object()` 只创建一次唯一标记；worker 用 `is` 判断取到的是否正是同一个对象，而不是某条普通数据 |
-| **drain** | producer 停止产生新数据后，`queue.join()` 等待已经接收的工作全部处理完成 |
-| **pipeline** | `source → producer → Queue → workers` 构成一条有输入、等待区和处理端的流水线 |
+| **`StopAsyncIteration`**            | `source()` 的 `for` 循环结束后由 async generator object 在内部发出，`async for` 据此停止          |
+| **`async for`**                     | `async for item in source()` 一项一项推进数据源，每次都允许先在 `asyncio.sleep()` 等待              |
+| **sentinel**                          | `SENTINEL = object()` 是 producer 与 worker 约定的结束标记；两个 worker 各收到一个                    |
+| **`object()` / `is`**             | `object()` 只创建一次唯一标记；worker 用 `is` 判断取到的是否正是同一个对象，而不是某条普通数据      |
+| **drain**                             | producer 停止产生新数据后，`queue.join()` 等待已经接收的工作全部处理完成                              |
+| **pipeline**                          | `source → producer → Queue → workers` 构成一条有输入、等待区和处理端的流水线                       |
 
 按时间线读输出：
 
@@ -231,14 +233,14 @@ Queue maxsize           → 控制 backlog
 
 先把两套词一一对应：
 
-| 普通逐项读取 | 异步逐项读取 |
-| --- | --- |
-| iterable | AsyncIterable |
-| iterator | AsyncIterator |
+| 普通逐项读取       | 异步逐项读取             |
+| ------------------ | ------------------------ |
+| iterable           | AsyncIterable            |
+| iterator           | AsyncIterator            |
 | generator function | async generator function |
-| generator object | async generator object |
-| `for` | `async for` |
-| `StopIteration` | `StopAsyncIteration` |
+| generator object   | async generator object   |
+| `for`            | `async for`            |
+| `StopIteration`  | `StopAsyncIteration`   |
 
 本课的 `source` 同时使用 `async def` 与 `yield`：
 
@@ -351,25 +353,14 @@ source 暂时不再继续读
 
 ## 常见误解
 
-- **误区：** Queue 越大，程序一定处理得越快。  
-  **更准确：** 更大的 Queue 往往只是允许更多 backlog 在内存里等待。
-
-- **误区：** 有 Semaphore 就不需要 Queue。  
-  **更准确：** Semaphore 控制 active concurrency；Queue 还能控制 backlog。
-
-- **误区：** producer 可以先把所有输入读完。  
-  **更准确：** 这样 backpressure 无法传回真正的数据源。
-
-- **误区：** `queue.get()` 后就算处理完成。  
-  **更准确：** 真正完成后还应调用 `task_done()`。
-
+- **误区：** Queue 越大，程序一定处理得越快。**更准确：** 更大的 Queue 往往只是允许更多 backlog 在内存里等待。
+- **误区：** 有 Semaphore 就不需要 Queue。**更准确：** Semaphore 控制 active concurrency；Queue 还能控制 backlog。
+- **误区：** producer 可以先把所有输入读完。**更准确：** 这样 backpressure 无法传回真正的数据源。
+- **误区：** `queue.get()` 后就算处理完成。**更准确：** 真正完成后还应调用 `task_done()`。
 - **误区：** 多调用几次 `task_done()` 更保险。
   **更准确：** 每个取出的 item 必须恰好对应一次；少一次会让 `join()` 等住，多一次会触发 `ValueError`。
-
-- **误区：** Sentinel 会自动结束所有 worker。  
-  **更准确：** 它只是一个约定值，worker 必须自己识别并结束。
-
-- **误区：** drain 就是立即停止。  
+- **误区：** Sentinel 会自动结束所有 worker。**更准确：** 它只是一个约定值，worker 必须自己识别并结束。
+- **误区：** drain 就是立即停止。
   **更准确：** drain 的承诺恰恰是把已经接收的工作处理完。
 
 ## 本节规则总结

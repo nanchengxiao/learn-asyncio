@@ -105,20 +105,20 @@ degradation：缺少推荐内容，页面仍返回
 
 把本课知识点对到代码上：
 
-| 术语或知识点 | 在这个例子里指什么 |
-| --- | --- |
-| **six-question model** | 工作单元是四个业务 node；两条 edge 写明依赖；两条 branch 可同时开始；失败分 required / optional；`aggregate()` 是 owner；真实 resource 上限在本例中省略 |
-| **node** | `fetch_user()`、`fetch_orders()`、`fetch_account()`、`fetch_recommendations()` 各代表一份具体工作 |
-| **edge** | `await fetch_account(user)` 与 `await fetch_recommendations(orders)` 同时传入 upstream 结果并表达启动顺序 |
-| **DAG** | 四个 node 和两条单向 edge 组成不会绕回起点的业务图；node 是业务工作，不要求每个 node 都单独创建 Task |
-| **branch** | `user_account_branch()` 与 `orders_recommendations_branch()` 分别执行一条依赖链；两条 branch 彼此独立，所以可以同时开始 |
-| **failure semantics** | `account` 属于 required，没有降级分支；recommendations 捕获自己的业务失败并返回 `None` |
-| **service** | 这个最小例子没有启动长期 server；`aggregate()` 可以作为 service 中一次请求对应的业务操作层 |
-| **aggregator** | `aggregate()` 并发运行两条独立 branch，最后把四份数据组合成一个字典 |
-| **custom exception** | `RecommendationsUnavailable` 精确命名允许 degradation 的失败；该分支只捕获这个已知类型，不会把无关程序错误伪装成 optional 缺失 |
-| **required dependency** | user、orders、account 必须存在，任何一项向外失败都会让 `TaskGroup` 无法正常完成 |
-| **optional dependency / degradation** | recommendations 失败后返回 `None`，页面明确减少内容但仍可成立 |
-| **Task ownership** | 两个 branch Task 都属于 `aggregate()` 内的 `TaskGroup`，函数返回前两条依赖链都已经结束 |
+| 术语或知识点                                | 在这个例子里指什么                                                                                                                                        |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **six-question model**                | 工作单元是四个业务 node；两条 edge 写明依赖；两条 branch 可同时开始；失败分 required / optional；`aggregate()` 是 owner；真实 resource 上限在本例中省略 |
+| **node**                              | `fetch_user()`、`fetch_orders()`、`fetch_account()`、`fetch_recommendations()` 各代表一份具体工作                                                 |
+| **edge**                              | `await fetch_account(user)` 与 `await fetch_recommendations(orders)` 同时传入 upstream 结果并表达启动顺序                                             |
+| **DAG**                               | 四个 node 和两条单向 edge 组成不会绕回起点的业务图；node 是业务工作，不要求每个 node 都单独创建 Task                                                      |
+| **branch**                            | `user_account_branch()` 与 `orders_recommendations_branch()` 分别执行一条依赖链；两条 branch 彼此独立，所以可以同时开始                               |
+| **failure semantics**                 | `account` 属于 required，没有降级分支；recommendations 捕获自己的业务失败并返回 `None`                                                                |
+| **service**                           | 这个最小例子没有启动长期 server；`aggregate()` 可以作为 service 中一次请求对应的业务操作层                                                              |
+| **aggregator**                        | `aggregate()` 并发运行两条独立 branch，最后把四份数据组合成一个字典                                                                                     |
+| **custom exception**                  | `RecommendationsUnavailable` 精确命名允许 degradation 的失败；该分支只捕获这个已知类型，不会把无关程序错误伪装成 optional 缺失                          |
+| **required dependency**               | user、orders、account 必须存在，任何一项向外失败都会让`TaskGroup` 无法正常完成                                                                          |
+| **optional dependency / degradation** | recommendations 失败后返回`None`，页面明确减少内容但仍可成立                                                                                            |
+| **Task ownership**                    | 两个 branch Task 都属于`aggregate()` 内的 `TaskGroup`，函数返回前两条依赖链都已经结束                                                                 |
 
 按时间线沿 DAG 读取：
 
@@ -335,25 +335,14 @@ resource 是否还有容量？
 
 ## 常见误解
 
-- **误区：** 看见四个 I/O 就全部同时开始。  
-  **更准确：** DAG 决定每个 node 最早启动时间。
-
-- **误区：** DAG 只是画图，不影响代码。  
-  **更准确：** 代码中的 `await` 路径与数据传递必须反映 edge；node 的业务处理不能越过尚未满足的 dependency。
-
+- **误区：** 看见四个 I/O 就全部同时开始。**更准确：** DAG 决定每个 node 最早启动时间。
+- **误区：** DAG 只是画图，不影响代码。**更准确：** 代码中的 `await` 路径与数据传递必须反映 edge；node 的业务处理不能越过尚未满足的 dependency。
 - **误区：** DAG 中每个 node 都必须创建成一个 Task。
   **更准确：** 只把需要独立调度和统一管理 lifecycle 的并发 branch 创建成 Task；同一依赖链通常直接顺序 `await`。
-
-- **误区：** optional 就是 `except Exception: pass`。  
-  **更准确：** optional 只说明某些明确业务失败允许 degradation；不能吞掉未知程序错误或调用者的 cancellation。
-
-- **误区：** failure semantics 就是“异常怎么写”。  
-  **更准确：** 它先决定业务结果，再决定用什么异常结构实现。
-
-- **误区：** DAG 已经决定了 concurrency limit。  
-  **更准确：** DAG 决定 dependency；resource 容量决定同时能占用多少 resource。
-
-- **误区：** 业务建模会降低 concurrency。  
+- **误区：** optional 就是 `except Exception: pass`。**更准确：** optional 只说明某些明确业务失败允许 degradation；不能吞掉未知程序错误或调用者的 cancellation。
+- **误区：** failure semantics 就是“异常怎么写”。**更准确：** 它先决定业务结果，再决定用什么异常结构实现。
+- **误区：** DAG 已经决定了 concurrency limit。**更准确：** DAG 决定 dependency；resource 容量决定同时能占用多少 resource。
+- **误区：** 业务建模会降低 concurrency。
   **更准确：** 它减少错误 concurrency；真正独立的工作仍应尽早重叠等待。
 
 ## 本节规则总结
