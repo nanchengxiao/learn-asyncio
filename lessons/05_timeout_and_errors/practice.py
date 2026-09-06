@@ -1,4 +1,5 @@
 import asyncio
+from typing import Any
 
 async def fetch_order() -> list[str]:
     """获取订单"""
